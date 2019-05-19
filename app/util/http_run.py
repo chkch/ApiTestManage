@@ -1,264 +1,25 @@
-import copy
 import json
-
+import types
 from app.models import *
-from httprunner import HttpRunner
+from httprunner.api import HttpRunner
 from ..util.global_variable import *
-from ..util.utils import merge_config
-from httprunner import (loader, parser, utils)
+from ..util.httprunner_change import *
+from ..util.utils import encode_object
 import importlib
-
-
-class MyHttpRunner(HttpRunner):
-    """
-    修改HttpRunner，用例初始化时导入函数
-    """
-
-    def __init__(self):
-        super(MyHttpRunner, self).__init__()
-
-    def parse_tests(self, testcases, variables_mapping=None):
-        """ parse testcases configs, including variables/parameters/name/request.
-
-        Args:
-            testcases (list): testcase list, with config unparsed.
-            variables_mapping (dict): if variables_mapping is specified, it will override variables in config block.
-
-        Returns:
-            list: parsed testcases list, with config variables/parameters/name/request parsed.
-
-        """
-        self.exception_stage = "parse tests"
-        variables_mapping = variables_mapping or {}
-
-        parsed_testcases_list = []
-        for testcase in testcases:
-            # parse config parameters
-            config_parameters = testcase.setdefault("config", {}).pop("parameters", [])
-
-            cartesian_product_parameters_list = parser.parse_parameters(
-                config_parameters,
-                self.project_mapping["debugtalk"]["variables"],
-                self.project_mapping["debugtalk"]["functions"]
-            ) or [{}]
-
-            for parameter_mapping in cartesian_product_parameters_list:
-                testcase_dict = testcase
-                config = testcase_dict.setdefault("config", {})
-
-                testcase_dict["config"]["functions"] = {}
-                if config.get('import_module_functions'):
-                    imported_module = importlib.reload(
-                        importlib.import_module(config.get('import_module_functions')[0]))
-                    debugtalk_module = loader.load_python_module(imported_module)
-                    testcase_dict["config"]["functions"].update(debugtalk_module["functions"])
-                testcase_dict["config"]["functions"].update(self.project_mapping["debugtalk"]["functions"])
-                # self.project_mapping["debugtalk"]["functions"].update(debugtalk_module["functions"])
-                raw_config_variables = config.get("variables", [])
-                parsed_config_variables = parser.parse_data(
-                    raw_config_variables,
-                    self.project_mapping["debugtalk"]["variables"],
-                    testcase_dict["config"]["functions"])
-
-                # priority: passed in > debugtalk.py > parameters > variables
-                # override variables mapping with parameters mapping
-                config_variables = utils.override_mapping_list(
-                    parsed_config_variables, parameter_mapping)
-                # merge debugtalk.py module variables
-                config_variables.update(self.project_mapping["debugtalk"]["variables"])
-                # override variables mapping with passed in variables_mapping
-                config_variables = utils.override_mapping_list(
-                    config_variables, variables_mapping)
-
-                testcase_dict["config"]["variables"] = config_variables
-
-                # parse config name
-                testcase_dict["config"]["name"] = parser.parse_data(
-                    testcase_dict["config"].get("name", ""),
-                    config_variables,
-                    self.project_mapping["debugtalk"]["functions"]
-                )
-
-                # parse config request
-                testcase_dict["config"]["request"] = parser.parse_data(
-                    testcase_dict["config"].get("request", {}),
-                    config_variables,
-                    self.project_mapping["debugtalk"]["functions"]
-                )
-                # put loaded project functions to config
-                # testcase_dict["config"]["functions"] = self.project_mapping["debugtalk"]["functions"]
-                parsed_testcases_list.append(testcase_dict)
-        return parsed_testcases_list
-
-
-def main_ate(cases):
-    runner = MyHttpRunner().run(cases)
-    summary = runner.summary
-    return summary
+from app import scheduler
+from flask.json import JSONEncoder
 
 
 class RunCase(object):
-    def __init__(self, project_names=None, case_ids=None, api_data=None, config_id=None):
-        self.project_names = project_names
-        self.case_ids = case_ids
-        self.config_id = config_id
-        self.api_data = api_data
-        self.project_data = Project.query.filter_by(name=self.project_names).first()
-        self.project_id = self.project_data.id
-        self.run_type = False  # 判断是接口调试(false)or业务用例执行(true)
-        self.make_report = True
+    def __init__(self, project_ids=None):
+        self.project_ids = project_ids
+        self.pro_config_data = None
+        self.pro_base_url = None
         self.new_report_id = None
-        self.temp_extract = list()
+        self.TEST_DATA = {'testcases': [], 'project_mapping': {'functions': {}, 'variables': {}}}
+        self.init_project_data()
 
-    def project_case(self):
-        if self.project_names and not self.case_ids and not self.api_data:
-            case_id = [s.id for s in Case.query.filter_by(project_id=self.project_id).order_by(Case.num.asc()).all()]
-            all_case_data = []
-            for c in case_id:
-                for c1 in CaseData.query.filter_by(scene_id=c).order_by(CaseData.num.asc()).all():
-                    all_case_data.append(c1)
-            self.run_type = True
-            return all_case_data
-        else:
-            return None
-
-    # def scene_case(self):
-    #     if self.scene_ids:
-    #         scene_id = [Scene.query.filter_by(name=n, project_id=self.project_id).first().id for n in self.scene_ids]
-    #         self.run_type = True
-    #         return scene_id
-    #     else:
-    #         return None
-    #
-    # def one_case(self):
-    #     if self.project_names and not self.scene_ids and self.case_data:
-    #         self.run_type = False
-    #         return self.case_data
-    #     else:
-    #         return None
-
-    @staticmethod
-    def pro_config(project_data):
-        """
-        把project的配置数据解析出来
-        :param project_data:
-        :return:
-        """
-        pro_cfg_data = {'config': {'name': 'config_name', 'request': {}, 'output': []}, 'teststeps': [],
-                        'name': 'config_name'}
-
-        pro_cfg_data['config']['request']['headers'] = {h['key']: h['value'] for h in
-                                                        json.loads(project_data.headers) if h.get('key')}
-
-        pro_cfg_data['config']['variables'] = json.loads(project_data.variables)
-        return pro_cfg_data
-
-    def get_test_case(self, case_data, pro_base_url):
-        if self.run_type:
-            # 为true，获取api基础信息；case只包含可改变部分所以还需要api基础信息组合成全新的用例
-            api_case = ApiMsg.query.filter_by(id=case_data.api_msg_id).first()
-        else:
-            # 为false，基础信息和参数信息都在api里面，所以api_case = case_data，直接赋值覆盖
-            api_case = case_data
-
-        temp_case_data = {'name': case_data.name,
-                          'request': {'method': api_case.method,
-                                      'files': {},
-                                      'data': {}}}
-        if json.loads(api_case.header):
-            temp_case_data['request']['headers'] = {h['key']: h['value'] for h in json.loads(api_case.header)
-                                                    if h['key']}
-
-        if api_case.status_url != '-1':
-            temp_case_data['request']['url'] = pro_base_url['{}'.format(api_case.project_id)][
-                                                   int(api_case.status_url)] + api_case.url.split('?')[0]
-        else:
-            temp_case_data['request']['url'] = api_case.url
-
-        if api_case.func_address:
-            temp_case_data['import_module_functions'] = [
-                'func_list.{}'.format(api_case.func_address.replace('.py', ''))]
-        # if self.run_type:
-        if not self.run_type:
-            if api_case.up_func:
-                temp_case_data['setup_hooks'] = [api_case.up_func]
-            if api_case.down_func:
-                temp_case_data['teardown_hooks'] = [api_case.down_func]
-        else:
-            if case_data.up_func:
-                temp_case_data['setup_hooks'] = [case_data.up_func]
-            if case_data.down_func:
-                temp_case_data['teardown_hooks'] = [case_data.down_func]
-
-        if not self.run_type or json.loads(case_data.status_param)[0]:
-            if not self.run_type or json.loads(case_data.status_param)[1]:
-                _param = json.loads(case_data.param)
-            else:
-                _param = json.loads(api_case.param)
-            temp_case_data['request']['params'] = {param['key']: param['value'] for param in
-                                                   _param if param.get('key')}
-
-        if not self.run_type or json.loads(case_data.status_variables)[0]:
-            if not self.run_type or json.loads(case_data.status_variables)[1]:
-                _json_variables = case_data.json_variable
-                _variables = json.loads(case_data.variable)
-
-            else:
-                _json_variables = api_case.json_variable
-                _variables = json.loads(case_data.variable)
-
-            if api_case.method == 'GET':
-                pass
-            elif api_case.variable_type == 'data':
-                for variable in _variables:
-                    if variable['param_type'] == 'string' and variable.get('key'):
-                        temp_case_data['request']['data'].update({variable['key']: variable['value']})
-                    elif variable['param_type'] == 'file' and variable.get('key'):
-                        temp_case_data['request']['files'].update({variable['key']: (
-                            variable['value'].split('/')[-1], open(variable['value'], 'rb'),
-                            CONTENT_TYPE['.{}'.format(variable['value'].split('.')[-1])])})
-                        # temp_case_data['request']['files'].update({variable['key']: (
-                        #     variable['value'].split('/')[-1], "open({}, 'rb')".format(variable['value']),
-                        #     CONTENT_TYPE['.{}'.format(variable['value'].split('.')[-1])])})
-
-                        # temp_case_data['request']['files'].update({variable['key']: (
-                        #     variable['value'].split('/')[-1], '${' + 'open_file({})'.format(variable['value']) + '}',
-                        #     CONTENT_TYPE['.{}'.format(variable['value'].split('.')[-1])])})
-
-            elif api_case.variable_type == 'json':
-                if _json_variables:
-                    temp_case_data['request']['json'] = json.loads(_json_variables)
-                # temp_case_data['request']['json'] = _variables
-
-        if not self.run_type or json.loads(case_data.status_extract)[0]:
-            if not self.run_type or json.loads(case_data.status_extract)[1]:
-                _extract_temp = case_data.extract
-            else:
-                _extract_temp = api_case.extract
-
-            temp_case_data['extract'] = [{ext['key']: ext['value']} for ext in json.loads(_extract_temp) if
-                                         ext.get('key')]
-            self.temp_extract += [ext.get('key') for ext in json.loads(_extract_temp) if ext.get('key')]
-
-        if not self.run_type or json.loads(case_data.status_validate)[0]:
-            if not self.run_type or json.loads(case_data.status_validate)[1]:
-                _validate_temp = case_data.validate
-            else:
-                _validate_temp = api_case.validate
-            temp_case_data['validate'] = [{val['comparator']: [val['key'], val['value']]} for val in
-                                          json.loads(_validate_temp) if val.get('key')]
-
-            temp_case_data['output'] = ['token']
-
-        return temp_case_data
-
-    def all_cases_data(self):
-        temp_case = []
-        pro_config = self.pro_config(self.project_data)
-
-        # 获取项目中4个基础url
-        # pro_base_url = {'0': self.project_data.host, '1': self.project_data.host_two,
-        #                 '2': self.project_data.host_three, '3': self.project_data.host_four}
+    def init_project_data(self):
         pro_base_url = {}
         for pro_data in Project.query.all():
             if pro_data.environment_choice == 'first':
@@ -269,123 +30,213 @@ class RunCase(object):
                 pro_base_url['{}'.format(pro_data.id)] = json.loads(pro_data.host_three)
             if pro_data.environment_choice == 'fourth':
                 pro_base_url['{}'.format(pro_data.id)] = json.loads(pro_data.host_four)
-        if self.case_ids:
-            for case_id in self.case_ids:
-                case_data = Case.query.filter_by(id=case_id).first()
-                case_times = case_data.times if case_data.times else 1
-                for s in range(case_times):
-                    _temp_config = copy.deepcopy(pro_config)
-                    _temp_config['config']['name'] = case_data.name
+        self.pro_base_url = pro_base_url
+        self.pro_config(Project.query.filter_by(id=self.project_ids).first())
 
-                    # 获取需要导入的函数文件数据
-                    _temp_config['config']['import_module_functions'] = ['func_list.{}'.format(
-                        case_data.func_address.replace('.py', ''))] if case_data.func_address else []
+    def pro_config(self, project_data):
+        """
+        把project的配置数据解析出来
+        :param project_data:
+        :return:
+        """
+        self.TEST_DATA['project_mapping']['variables'] = {h['key']: h['value'] for h in
+                                                          json.loads(project_data.variables) if h.get('key')}
+        if project_data.func_file:
+            self.extract_func([project_data.func_file.replace('.py', '')])
 
-                    # 获取业务集合的配置数据
-                    scene_config = json.loads(case_data.variable) if case_data.variable else []
+    def extract_func(self, func_list):
+        """
+        提取函数文件中的函数
+        :param func_list: 函数文件地址list
+        :return:
+        """
+        for f in func_list:
+            func_list = importlib.reload(importlib.import_module('func_list.{}'.format(f)))
+            module_functions_dict = {name: item for name, item in vars(func_list).items()
+                                     if isinstance(item, types.FunctionType)}
+            self.TEST_DATA['project_mapping']['functions'].update(module_functions_dict)
 
-                    # 合并公用项目配置和业务集合配置
-                    _temp_config = merge_config(_temp_config, scene_config)
-                    for api_case in CaseData.query.filter_by(case_id=case_id).order_by(CaseData.num.asc()).all():
-                        if api_case.status == 'true':  # 判断用例状态，是否执行
-                            for t in range(api_case.time):  # 获取用例执行次数，遍历添加
-                                _temp_config['teststeps'].append(self.get_test_case(api_case, pro_base_url))
-                    temp_case.append(_temp_config)
-            return temp_case
+    def assemble_step(self, api_id=None, step_data=None, pro_base_url=None, status=False):
+        """
+        :param api_id:
+        :param step_data:
+        :param pro_base_url:
+        :param status: 判断是接口调试(false)or业务用例执行(true)
+        :return:
+        """
+        if status:
+            # 为true，获取api基础信息；case只包含可改变部分所以还需要api基础信息组合成全新的用例
+            api_data = ApiMsg.query.filter_by(id=step_data.api_msg_id).first()
+        else:
+            # 为false，基础信息和参数信息都在api里面，所以api_case = case_data，直接赋值覆盖
+            api_data = ApiMsg.query.filter_by(id=api_id).first()
+            step_data = api_data
+            # api_data = case_data
 
-        if self.api_data:
-            _temp_config = copy.deepcopy(pro_config)
-            config_data = Config.query.filter_by(id=self.config_id).first()
-            _config = json.loads(config_data.variables) if self.config_id else []
-            _temp_config['config']['import_module_functions'] = ['func_list.{}'.format(
-                config_data.func_address.replace('.py', ''))] if config_data and config_data.func_address else []
+        _data = {'name': step_data.name,
+                 'request': {'method': api_data.method,
+                             'files': {},
+                             'data': {}}}
 
-            _temp_config = merge_config(_temp_config, _config)
-            _temp_config['teststeps'] = [self.get_test_case(case, pro_base_url) for case in self.api_data]
-            _temp_config['config']['output'] += copy.deepcopy(self.temp_extract)
-            return _temp_config
-            # return temp_case
+        _data['request']['headers'] = {h['key']: h['value'] for h in json.loads(api_data.header)
+                                       if h['key']} if json.loads(api_data.header) else {}
+
+        if api_data.status_url != '-1':
+            _data['request']['url'] = pro_base_url['{}'.format(api_data.project_id)][
+                                          int(api_data.status_url)] + api_data.url.split('?')[0]
+        else:
+            _data['request']['url'] = api_data.url
+
+        if step_data.up_func:
+            _data['setup_hooks'] = [step_data.up_func]
+
+        if step_data.down_func:
+            _data['teardown_hooks'] = [step_data.down_func]
+
+        if status:
+            _data['times'] = step_data.time
+            if json.loads(step_data.status_param)[0]:
+                if json.loads(step_data.status_param)[1]:
+                    _param = json.loads(step_data.param)
+                else:
+                    _param = json.loads(api_data.param)
+            else:
+                _param = None
+
+            if json.loads(step_data.status_variables)[0]:
+                if json.loads(step_data.status_variables)[1]:
+                    _json_variables = step_data.json_variable
+                    _variables = json.loads(step_data.variable)
+                else:
+                    _json_variables = api_data.json_variable
+                    _variables = json.loads(api_data.variable)
+            else:
+                _json_variables = None
+                _variables = None
+
+            if json.loads(step_data.status_extract)[0]:
+                if json.loads(step_data.status_extract)[1]:
+                    _extract = step_data.extract
+                else:
+                    _extract = api_data.extract
+            else:
+                _extract = None
+
+            if json.loads(step_data.status_validate)[0]:
+                if json.loads(step_data.status_validate)[1]:
+                    _validate = step_data.validate
+                else:
+                    _validate = api_data.validate
+            else:
+                _validate = None
+
+        else:
+            _param = json.loads(api_data.param)
+            _json_variables = api_data.json_variable
+            _variables = json.loads(api_data.variable)
+            _extract = api_data.extract
+            _validate = api_data.validate
+
+        _data['request']['params'] = {param['key']: param['value'].replace('%', '&') for param in
+                                      _param if param.get('key')} if _param else {}
+
+        _data['extract'] = [{ext['key']: ext['value']} for ext in json.loads(_extract) if
+                            ext.get('key')] if _extract else []
+
+        _data['validate'] = [{val['comparator']: [val['key'], val['value']]} for val in json.loads(_validate) if
+                             val.get('key')] if _validate else []
+
+        if api_data.method == 'GET':
+            pass
+        # elif _variables:
+        #     print(_variables)
+        #     print(111)
+        elif api_data.variable_type == 'text' and _variables:
+            for variable in _variables:
+                if variable['param_type'] == 'string' and variable.get('key'):
+                    _data['request']['files'].update({variable['key']: (None, variable['value'])})
+                elif variable['param_type'] == 'file' and variable.get('key'):
+                    _data['request']['files'].update({variable['key']: (
+                        variable['value'].split('/')[-1], open(variable['value'], 'rb'),
+                        CONTENT_TYPE['.{}'.format(variable['value'].split('.')[-1])])})
+
+        elif api_data.variable_type == 'data' and _variables:
+            for variable in _variables:
+                if variable['param_type'] == 'string' and variable.get('key'):
+                    _data['request']['data'].update({variable['key']: variable['value']})
+                elif variable['param_type'] == 'file' and variable.get('key'):
+                    _data['request']['files'].update({variable['key']: (
+                        variable['value'].split('/')[-1], open(variable['value'], 'rb'),
+                        CONTENT_TYPE['.{}'.format(variable['value'].split('.')[-1])])})
+
+        elif api_data.variable_type == 'json':
+            if _json_variables:
+                _data['request']['json'] = json.loads(_json_variables)
+
+        return _data
+
+    def get_api_test(self, api_ids, config_id):
+        """
+        接口调试时，用到的方法
+        :param api_ids: 接口id列表
+        :param config_id: 配置id
+        :return:
+        """
+        scheduler.app.logger.info('本次测试的接口id：{}'.format(api_ids))
+        _steps = {'teststeps': [], 'config': {'variables': {}}, 'output': ['phone']}
+
+        if config_id:
+            config_data = Config.query.filter_by(id=config_id).first()
+            _config = json.loads(config_data.variables) if config_id else []
+            _steps['config']['variables'].update({v['key']: v['value'] for v in _config if v['key']})
+            self.extract_func(['{}'.format(f.replace('.py', '')) for f in json.loads(config_data.func_address)])
+
+        _steps['teststeps'] = [self.assemble_step(api_id, None, self.pro_base_url, False) for api_id in api_ids]
+        self.TEST_DATA['testcases'].append(_steps)
+
+    def get_case_test(self, case_ids):
+        """
+        用例调试时，用到的方法
+        :param case_ids: 用例id列表
+        :return:
+        """
+        scheduler.app.logger.info('本次测试的用例id：{}'.format(case_ids))
+
+        for case_id in case_ids:
+            case_data = Case.query.filter_by(id=case_id).first()
+            case_times = case_data.times if case_data.times else 1
+            for s in range(case_times):
+                _steps = {'teststeps': [], 'config': {'variables': {}, 'name': ''}}
+                _steps['config']['name'] = case_data.name
+
+                # 获取用例的配置数据
+                _config = json.loads(case_data.variable) if case_data.variable else []
+                _steps['config']['variables'].update({v['key']: v['value'] for v in _config if v['key']})
+
+                self.extract_func(['{}'.format(f.replace('.py', '')) for f in json.loads(case_data.func_address)])
+
+                for _step in CaseData.query.filter_by(case_id=case_id).order_by(CaseData.num.asc()).all():
+                    if _step.status == 'true':  # 判断步骤状态，是否执行
+                        _steps['teststeps'].append(self.assemble_step(None, _step, self.pro_base_url, True))
+                self.TEST_DATA['testcases'].append(_steps)
+
+    def build_report(self, jump_res, case_ids):
+
+        new_report = Report(
+            case_names=','.join([Case.query.filter_by(id=scene_id).first().name for scene_id in case_ids]),
+            project_id=self.project_ids, read_status='待阅')
+        db.session.add(new_report)
+        db.session.commit()
+
+        self.new_report_id = new_report.id
+        with open('{}{}.txt'.format(REPORT_ADDRESS, self.new_report_id), 'w') as f:
+            f.write(jump_res)
 
     def run_case(self):
-        now_time = datetime.datetime.now()
-
-        if self.run_type and self.make_report:
-            new_report = Report(
-                name=','.join([Case.query.filter_by(id=scene_id).first().name for scene_id in self.case_ids]),
-                data='{}.txt'.format(now_time.strftime('%Y/%m/%d %H:%M:%S')),
-                belong_pro=self.project_names, read_status='待阅')
-            db.session.add(new_report)
-            db.session.commit()
-        d = self.all_cases_data()
-        print(d)
-        res = main_ate(d)
-
-        res['time']['duration'] = "%.2f" % res['time']['duration']
-        res['stat']['successes_1'] = res['stat']['successes']
-        res['stat']['failures_1'] = res['stat']['failures']
-        res['stat']['errors_1'] = res['stat']['errors']
-        res['stat']['successes'] = "{} ({}%)".format(res['stat']['successes'],
-                                                     int(res['stat']['successes'] / res['stat']['testsRun'] * 100))
-        res['stat']['failures'] = "{} ({}%)".format(res['stat']['failures'],
-                                                    int(res['stat']['failures'] / res['stat']['testsRun'] * 100))
-        res['stat']['errors'] = "{} ({}%)".format(res['stat']['errors'],
-                                                  int(res['stat']['errors'] / res['stat']['testsRun'] * 100))
-        res['stat']['successes_scene'] = 0
-        res['stat']['failures_scene'] = 0
-        for num_1, res_1 in enumerate(res['details']):
-            if res_1['success']:
-                res['stat']['successes_scene'] += 1
-            else:
-                res['stat']['failures_scene'] += 1
-            res_1['in_out']['in'] = str(res_1['in_out']['in'])
-            # res_1['in_out']['out'] = res_1['in_out']['out'] if res_1['in_out']['out'] else None
-            for num_2, rec_2 in enumerate(res_1['records']):
-                if isinstance(rec_2['meta_data']['response']['content'], bytes):
-                    rec_2['meta_data']['response']['content'] = bytes.decode(rec_2['meta_data']['response']['content'])
-                if rec_2['meta_data']['request'].get('body'):
-                    if isinstance(rec_2['meta_data']['request']['body'], bytes):
-                        if b'filename=' in rec_2['meta_data']['request']['body']:
-                            rec_2['meta_data']['request']['body'] = '暂不支持显示文件上传的request_body'
-                            rec_2['meta_data']['request']['files']['file'] = [0]
-                        else:
-                            rec_2['meta_data']['request']['body'] = bytes.decode(rec_2['meta_data']['request']['body'])
-
-                if rec_2['meta_data']['request'].get('data'):
-                    if isinstance(rec_2['meta_data']['request']['data'], bytes):
-                        rec_2['meta_data']['request']['data'] = bytes.decode(rec_2['meta_data']['request']['data'])
-
-                if rec_2['meta_data']['response'].get('cookies'):
-                    rec_2['meta_data']['response']['cookies'] = dict(
-                        res['details'][0]['records'][0]['meta_data']['response']['cookies'])
-                    # for num, rec in enumerate(res['details'][0]['records']):
-                    # try:
-                    # if not rec['meta_data'].get('url'):
-                    #     rec['meta_data']['url'] = self.temporary_url[num] + '\n(url请求失败，这为原始url，)'
-                    # if 'Linux' in platform.platform():
-                    #     rec['meta_data']['response_time(ms)'] = rec['meta_data'].get('response_time_ms')
-                    # if rec['meta_data'].get('response_headers'):
-                    #     rec['meta_data']['response_headers'] = dict(res['records'][num]['meta_data']['response_headers'])
-                    # if rec['meta_data'].get('request_headers'):
-                    #     rec['meta_data']['request_headers'] = dict(res['records'][num]['meta_data']['request_headers'])
-                    # if rec['meta_data'].get('request_body'):
-                    #     if isinstance(rec['meta_data']['request_body'], bytes):
-                    #         if b'filename=' in rec['meta_data']['request_body']:
-                    #             rec['meta_data']['request_body'] = '暂不支持显示文件上传的request_body'
-                    #         else:
-                    #             rec['meta_data']['request_body'] = rec['meta_data']['request_body'].decode('unicode-escape')
-
-                    # if rec['meta_data'].get('response_body'):
-                    #     if isinstance(rec['meta_data']['response_body'], bytes):
-                    #         rec['meta_data']['response_body'] = bytes.decode(rec['meta_data']['response_body'])
-                    # if not rec['meta_data'].get('response_headers'):
-                    #     rec['meta_data']['response_headers'] = 'None'
-
-        res['time']['start_at'] = now_time.strftime('%Y/%m/%d %H:%M:%S')
-        print(res)
-        jump_res = json.dumps(res, ensure_ascii=False)
-        if self.run_type and self.make_report:
-            self.new_report_id = Report.query.filter_by(
-                data='{}.txt'.format(now_time.strftime('%Y/%m/%d %H:%M:%S'))).first().id
-            with open('{}{}.txt'.format(REPORT_ADDRESS, self.new_report_id), 'w') as f:
-                f.write(jump_res)
+        scheduler.app.logger.info('测试数据：{}'.format(self.TEST_DATA))
+        # res = main_ate(self.TEST_DATA)
+        runner = HttpRunner()
+        runner.run(self.TEST_DATA)
+        jump_res = json.dumps(runner._summary, ensure_ascii=False, default=encode_object, cls=JSONEncoder)
+        # scheduler.app.logger.info('返回数据：{}'.format(jump_res))
         return jump_res

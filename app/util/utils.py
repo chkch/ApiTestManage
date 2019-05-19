@@ -7,13 +7,7 @@ import types
 
 
 def auto_num(num, model, **kwargs):
-    """
-    自动返回编号的最大值
-    :param num:
-    :param model:
-    :param kwargs:
-    :return:
-    """
+    """自动返回编号的最大值"""
     if not num:
         if not model.query.filter_by(**kwargs).all():
             return 1
@@ -22,35 +16,29 @@ def auto_num(num, model, **kwargs):
     return num
 
 
-def num_sort(new_num, old_num, model, **kwargs):
-    """
-    修改排序功能
-    :param new_num:
-    :param old_num:
-    :param model:
-    :param kwargs:
-    :return:
-    """
-    if int(new_num) < old_num:  # 当需要修改的序号少于原来的序号
-        model.query.filter_by(num=old_num, **kwargs).first().num = 99999
-        for n in reversed(range(int(new_num), old_num)):
-            change_num = model.query.filter_by(num=n, **kwargs).first()
-            if change_num:
-                change_num.num = n + 1
-        model.query.filter_by(num=99999, **kwargs).first().num = new_num
+def num_sort(new_num, old_num, list_data, old_data):
+    """修改排序,自动按新旧序号重新排列"""
+    if old_data not in list_data:
+        old_data.num = len(list_data)+1
+    else:
+        _temp_data = list_data.pop(list_data.index(old_data))
+        list_data.insert(new_num - 1, _temp_data)
+        if old_num == new_num:
+            pass
+        elif old_num > new_num:
+            for n, m in enumerate(list_data[new_num - 1:old_num + 1]):
+                m.num = new_num + n
 
-    else:  # 当需要修改的序号大于原来的序号
-        model.query.filter_by(num=old_num, **kwargs).first().num = 99999
-        for n in range(old_num + 1, int(new_num) + 1):
-            change_num = model.query.filter_by(num=n, **kwargs).first()
-            if change_num:
-                change_num.num = n - 1
-        model.query.filter_by(num=99999, **kwargs).first().num = new_num
+        elif old_data.num < new_num:
+            for n, m in enumerate(list_data[old_num - 1:new_num + 1]):
+                m.num = old_num + n
 
 
 variable_regexp = r"\$([\w_]+)"
 function_regexp = r"\$\{([\w_]+\([\$\w\.\-_ =,]*\))\}"
+# function_regexp = r"\$\{([\w_]+\([\$\w\W\.\-_ =,]*\))\}"
 function_regexp_compile = re.compile(r"^([\w_]+)\(([\$\w\.\-/_ =,]*)\)$")
+# function_regexp_compile = re.compile(r"^([\w_]+)\(([\$\w\W\.\-/_ =,]*)\)$")
 
 
 def extract_variables(content):
@@ -87,12 +75,14 @@ def extract_functions(content):
 
 
 def check_case(case_data, func_address):
+    module_functions_dict = {}
     if func_address:
-        import_path = 'func_list.{}'.format(func_address.replace('.py', ''))
-        func_list = importlib.reload(importlib.import_module(import_path))
-        module_functions_dict = {name: item for name, item in vars(func_list).items() if
-                                 isinstance(item, types.FunctionType)}
-        # module_functions_dict = dict(filter(is_function, vars(func_list).items()))
+        for f in json.loads(func_address):
+            import_path = 'func_list.{}'.format(f.replace('.py', ''))
+            func_list = importlib.reload(importlib.import_module(import_path))
+            module_functions_dict.update({name: item for name, item in vars(func_list).items() if
+                                          isinstance(item, types.FunctionType)})
+            # module_functions_dict = dict(filter(is_function, vars(func_list).items()))
 
     if isinstance(case_data, list):
         for c in case_data:
@@ -124,6 +114,13 @@ def check_case(case_data, func_address):
 
 
 def convert(variable):
+    """ 同层次参数中，存在引用关系就先赋值
+    eg:
+        phone:123
+        name:$phone
+        => phone:123
+           name:123
+    """
     _temp = json.dumps(variable)
     content = {v['key']: v['value'] for v in variable if v['key'] != ''}
     for variable_name in extract_variables(_temp):
@@ -134,27 +131,6 @@ def convert(variable):
                 str(content.get(variable_name)), 1
             )
     return _temp
-
-
-def merge_config(pro_config, scene_config):
-    """
-    合并公用项目配置和业务集合配置
-    :param pro_config:
-    :param scene_config:
-    :return:
-    """
-    for _s in scene_config:
-        for _p in pro_config['config']['variables']:
-            if _p['key'] == _s['key']:
-                break
-        else:
-            pro_config['config']['variables'].append(_s)
-
-    _temp = convert(pro_config['config']['variables'])
-    pro_config['config']['variables'] = [{v['key']: v['value']} for v in json.loads(_temp)
-                                         if v['key']]
-    # pro_config['config']['output'] = ['token']
-    return pro_config
 
 
 def change_cron(expression):
@@ -246,14 +222,27 @@ def parse_function(content):
     return function_meta
 
 
+def encode_object(obj):
+    """ json.dumps转化时，先把属于bytes类型的解码，若解码失败返回str类型，和其他对象属性统一转化成str"""
+    if isinstance(obj, bytes):
+        try:
+            return bytes.decode(obj)
+        except Exception as e:
+            return str(obj)
+    else:
+        return str(obj)
+
+    # raise TypeError("{} is not JSON serializable".format(obj))
+
+
 if __name__ == '__main__':
     # func_list = importlib.reload(importlib.import_module(r"func_list.abuild_in_fun.py"))
     # module_functions_dict = {name: item for name, item in vars(func_list).items() if
     #                          isinstance(item, types.FunctionType)}
     # print(module_functions_dict)
-    a = '${func($test,123)}'
+    a = '${func({"birthday": "199-02-02"; "expire_age": "65周岁"; "sex": "2"},123,3245)}'
     b = '${func([123],123)}'
-    print(extract_functions(b))
-    matched = parse_function(extract_functions(b)[0])
-
-    print(matched)
+    print(extract_functions(a))
+    # matched = parse_function(extract_functions(b)[0])
+    #
+    # print(matched)

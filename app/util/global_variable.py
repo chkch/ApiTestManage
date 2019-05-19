@@ -691,10 +691,9 @@ CONTENT_TYPE = {
 }
 REPORT_ADDRESS = os.path.abspath('..') + r'/reports/'
 LOG_ADDRESS = os.path.abspath('..') + r'/logs/'
-TEMP_REPORT = os.path.abspath('.') + r'/app/util'
+TEMP_REPORT = os.path.abspath('.') + r'/app/util/report'
 FUNC_ADDRESS = os.path.abspath('.') + r'/func_list'
 FILE_ADDRESS = os.path.abspath('..') + r'/files/'
-HOST = {'0': 'host', '1': 'host_two', '2': 'host_three', '3': 'host_four'}
 
 
 def _check_file_path():
@@ -711,7 +710,4 @@ def _check_file_path():
 _check_file_path()
 
 if __name__ == '__main__':
-    a = "E:\project/files/平安团体意外险模板.xlsx"
-    a1 = a.split('.')[-1]
-    print(a1)
-    print(CONTENT_TYPE['.{}'.format(a.split('.')[-1])])
+    pass
